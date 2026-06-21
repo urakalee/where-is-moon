@@ -56,6 +56,7 @@
     max-width: 560px;
   }
   canvas { display: block; width: 100%; border-radius: 12px; box-shadow: 0 2px 12px rgba(74,111,165,0.15); }
+  #phaseIcon { width: 48px; height: 48px; border-radius: 50%; box-shadow: none; }
 
   .info-grid {
     display: grid;
@@ -131,7 +132,7 @@
 </div>
 
 <div class="phase-bar">
-  <div class="phase-icon" id="phaseIcon">🌑</div>
+  <canvas id="phaseIcon" width="48" height="48" style="flex-shrink:0"></canvas>
   <div class="phase-text">
     <div class="name" id="phaseName">计算中…</div>
     <div class="illumination" id="illumination">照明度 --%</div>
@@ -242,33 +243,39 @@ function equatToHoriz(ra, dec, lat, lon, jd) {
   return { alt, az };
 }
 
-// 月相：太阳黄经（低精度）
-function sunLongitude(jd) {
+// 太阳赤经赤纬（低精度）
+function sunEquatorial(jd) {
   const n = jd - 2451545.0;
+  const T = n / 36525;
   const L = 280.460 + 0.9856474 * n;
   const g = ((357.528 + 0.9856003 * n) % 360 + 360) % 360;
-  return ((L + 1.915 * Math.sin(toRad(g)) + 0.020 * Math.sin(toRad(2 * g))) % 360 + 360) % 360;
+  const lam = ((L + 1.915 * Math.sin(toRad(g)) + 0.020 * Math.sin(toRad(2 * g))) % 360 + 360) % 360;
+  const eps = 23.4393 - 0.0130042 * T;
+  const lamR = toRad(lam), epsR = toRad(eps);
+  const ra = toDeg(Math.atan2(Math.sin(lamR) * Math.cos(epsR), Math.cos(lamR)));
+  const dec = toDeg(Math.asin(Math.sin(epsR) * Math.sin(lamR)));
+  return { ra: ((ra % 360) + 360) % 360, dec, lam };
 }
 
 function moonPhase(jd) {
   const moonLam = moonEquatorial(jd).lam;
-  const sunLam = sunLongitude(jd);
-  const elongation = ((moonLam - sunLam) % 360 + 360) % 360;
+  const sun = sunEquatorial(jd);
+  const elongation = ((moonLam - sun.lam) % 360 + 360) % 360;
   const illumination = (1 - Math.cos(toRad(elongation))) / 2;
 
   const phases = [
-    { max: 22.5,  icon: '🌑', name: '新月' },
-    { max: 67.5,  icon: '🌒', name: '娥眉月' },
-    { max: 112.5, icon: '🌓', name: '上弦月' },
-    { max: 157.5, icon: '🌔', name: '盈凸月' },
-    { max: 202.5, icon: '🌕', name: '满月' },
-    { max: 247.5, icon: '🌖', name: '亏凸月' },
-    { max: 292.5, icon: '🌗', name: '下弦月' },
-    { max: 337.5, icon: '🌘', name: '残月' },
-    { max: 360,   icon: '🌑', name: '新月' },
+    { max: 22.5,  name: '新月' },
+    { max: 67.5,  name: '娥眉月' },
+    { max: 112.5, name: '上弦月' },
+    { max: 157.5, name: '盈凸月' },
+    { max: 202.5, name: '满月' },
+    { max: 247.5, name: '亏凸月' },
+    { max: 292.5, name: '下弦月' },
+    { max: 337.5, name: '残月' },
+    { max: 360,   name: '新月' },
   ];
   const p = phases.find(p => elongation < p.max) || phases[phases.length - 1];
-  return { ...p, illumination, elongation };
+  return { ...p, illumination, elongation, sunRa: sun.ra, sunDec: sun.dec };
 }
 
 // 月出月落：以北京时间当天 0:00 为起点扫描，返回北京分钟数
@@ -317,8 +324,87 @@ function azToDir(az) {
   return dirs[Math.round(az / 45) % 8];
 }
 
+// ── 月相绘制 ──────────────────────────────────────────
+// brightAngle: canvas 角度，旋转后亮面（太阳方向）在右侧（angle=0）
+function drawMoon(ctx, x, y, r, brightAngle, illumination, darkBg) {
+  const cosElong = 1 - 2 * illumination; // +1=新月, 0=弦月, -1=满月
+  const darkColor  = darkBg ? '#808898' : '#c0c4d0';
+  const brightColor = darkBg ? '#d8dce8' : '#f0eed8';
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(brightAngle);
+
+  // 先 clip 到圆形
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.clip();
+
+  // 1. 整圆填暗色
+  ctx.fillStyle = darkColor;
+  ctx.fillRect(-r - 1, -r - 1, (r + 1) * 2, (r + 1) * 2);
+
+  // 2. 右半圆填亮色
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2); // 右半圆 clip
+  ctx.lineTo(0, 0);
+  ctx.clip();
+  ctx.fillStyle = brightColor;
+  ctx.fillRect(-r - 1, -r - 1, (r + 1) * 2, (r + 1) * 2);
+  ctx.restore();
+
+  // 3. 终结线椭圆调整月相胖瘦
+  if (cosElong > 0) {
+    // 新月→上弦：右侧剪掉一块暗椭圆（crescent）
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2); // 右半圆 clip
+    ctx.lineTo(0, 0);
+    ctx.clip();
+    ctx.fillStyle = darkColor;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * cosElong, r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  } else if (cosElong < 0) {
+    // 下弦→新月：左侧补一块亮椭圆（gibbous）
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2); // 左半圆 clip
+    ctx.lineTo(0, 0);
+    ctx.clip();
+    ctx.fillStyle = brightColor;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * (-cosElong), r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 4. 月面纹理
+  ctx.fillStyle = 'rgba(140,145,158,0.25)';
+  [[-r*0.25, -r*0.2, r*0.28], [r*0.3, r*0.25, r*0.2], [-r*0.1, r*0.35, r*0.22]].forEach(([dx, dy, dr]) => {
+    ctx.beginPath();
+    ctx.arc(dx, dy, dr, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  ctx.restore();
+}
+
+// 月亮亮面朝向角：从月亮指向太阳，转为 canvas 角度（右=0，下=PI/2）
+function moonBrightAngle(moonAlt, moonAz, sunAlt, sunAz) {
+  let dAz = sunAz - moonAz;
+  // 归一化到 -180 ~ +180
+  if (dAz > 180) dAz -= 360;
+  if (dAz < -180) dAz += 360;
+  const dAlt = sunAlt - moonAlt;
+  // canvas y 轴向下，高度差取反
+  return Math.atan2(-dAlt, dAz);
+}
+
 // ── 绘图 ──────────────────────────────────────────────
-function drawSky(alt, az) {
+function drawSky(alt, az, phase, jd) {
   const canvas = document.getElementById('sky');
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
@@ -357,20 +443,34 @@ function drawSky(alt, az) {
   // 地平线标注
   ctx.fillStyle = '#4a7a44';
   ctx.font = '11px sans-serif';
+  // 线性方位映射：月亮方位在中央，左右各展开 90°
+  const VIEW_HALF = 90; // 可视范围半角
+  const azToX = (a) => {
+    let diff = ((a - az) % 360 + 360) % 360;
+    if (diff > 180) diff -= 360; // -180 ~ +180
+    return cx + (diff / VIEW_HALF) * cx;
+  };
+
   ctx.textAlign = 'center';
   [['北', 0], ['东', 90], ['南', 180], ['西', 270]].forEach(([label, dir]) => {
-    const dx = Math.sin(toRad(dir - az)) * cx * 0.85;
-    ctx.fillText(label, cx + dx, hz + 16);
+    let diff = ((dir - az) % 360 + 360) % 360;
+    if (diff > 180) diff -= 360;
+    if (Math.abs(diff) > VIEW_HALF + 5) return; // 超出视野不画
+    const x = azToX(dir);
+    ctx.fillText(label, x, hz + 16);
   });
 
-  // 方位标尺
+  // 方位标尺（线性）
   ctx.strokeStyle = 'rgba(74,122,68,0.4)';
   ctx.lineWidth = 1;
   for (let a = 0; a < 360; a += 45) {
-    const dx = Math.sin(toRad(a - az)) * cx * 0.85;
+    let diff = ((a - az) % 360 + 360) % 360;
+    if (diff > 180) diff -= 360;
+    if (Math.abs(diff) > VIEW_HALF) continue;
+    const x = azToX(a);
     ctx.beginPath();
-    ctx.moveTo(cx + dx, hz - 4);
-    ctx.lineTo(cx + dx, hz + 4);
+    ctx.moveTo(x, hz - 4);
+    ctx.lineTo(x, hz + 4);
     ctx.stroke();
   }
 
@@ -401,8 +501,11 @@ function drawSky(alt, az) {
     moonY = hz + (Math.min(Math.abs(alt), 90) / 90) * (H - hz) * 0.7;
   }
 
+  const sunHoriz = equatToHoriz(phase.sunRa, phase.sunDec, LAT, LON, jd);
+  const brightAngle = moonBrightAngle(alt, az, sunHoriz.alt, sunHoriz.az);
+
   if (above) {
-    // 月亮光晕
+    // 光晕
     const glow = ctx.createRadialGradient(moonX, moonY, 0, moonX, moonY, 40);
     glow.addColorStop(0, 'rgba(200,210,255,0.35)');
     glow.addColorStop(1, 'rgba(200,210,255,0)');
@@ -411,25 +514,7 @@ function drawSky(alt, az) {
     ctx.arc(moonX, moonY, 40, 0, Math.PI * 2);
     ctx.fill();
 
-    // 月亮本体
-    ctx.fillStyle = '#e8e8d8';
-    ctx.beginPath();
-    ctx.arc(moonX, moonY, 18, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(150,150,120,0.4)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    // 月面纹理
-    ctx.fillStyle = 'rgba(180,180,160,0.5)';
-    ctx.beginPath();
-    ctx.arc(moonX - 4, moonY - 3, 5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(moonX + 6, moonY + 4, 3.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(moonX - 2, moonY + 6, 4, 0, Math.PI * 2);
-    ctx.fill();
+    drawMoon(ctx, moonX, moonY, 18, brightAngle, phase.illumination, false);
 
     // 虚线到地平线
     ctx.strokeStyle = 'rgba(74,111,165,0.35)';
@@ -441,7 +526,7 @@ function drawSky(alt, az) {
     ctx.stroke();
     ctx.setLineDash([]);
   } else {
-    // 地平线以下：月亮轮廓虚线
+    // 地平线以下：虚线轮廓
     ctx.strokeStyle = 'rgba(74,111,165,0.4)';
     ctx.lineWidth = 2;
     ctx.setLineDash([5, 5]);
@@ -449,7 +534,7 @@ function drawSky(alt, az) {
     ctx.arc(moonX, moonY, 18, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(74,111,165,0.1)';
+    ctx.fillStyle = 'rgba(74,111,165,0.08)';
     ctx.beginPath();
     ctx.arc(moonX, moonY, 18, 0, Math.PI * 2);
     ctx.fill();
@@ -508,11 +593,18 @@ function update() {
   document.getElementById('riseSet').textContent = fmtTime(rt.rise) + ' / ' + fmtTime(rt.set);
   document.getElementById('transitEl').textContent = '中天 ' + fmtTime(rt.transit);
 
-  document.getElementById('phaseIcon').textContent = phase.icon;
   document.getElementById('phaseName').textContent = phase.name;
   document.getElementById('illumination').textContent = '照明度 ' + (phase.illumination * 100).toFixed(0) + '%';
 
-  drawSky(alt, az);
+  // phase bar 小图标
+  const iconCanvas = document.getElementById('phaseIcon');
+  const ic = iconCanvas.getContext('2d');
+  ic.clearRect(0, 0, 48, 48);
+  const sunH = equatToHoriz(phase.sunRa, phase.sunDec, LAT, LON, jd);
+  const ba = moonBrightAngle(alt, az, sunH.alt, sunH.az);
+  drawMoon(ic, 24, 24, 20, ba, phase.illumination, false);
+
+  drawSky(alt, az, phase, jd);
 }
 
 function setNow() {
